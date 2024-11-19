@@ -1,0 +1,10 @@
+/Attack_Data/*
+/Attack Gen/*
+/Bus_Data/*
+/evaluation_logs/*
+/LSTM Model/*
+/LSTM_Models/*
+/metrics_plots/*
+/Plot/*
+/training_logs/*
+*.ipynb
