@@ -2033,32 +2033,65 @@ class DQNAgent:
 
             # Define possible deception amounts
             possible_deceptions = np.arange(20, 85, 5)  # [20, 25, 30, ..., 75, 80]
-
+        
+            # Add memory of recent performance
+            if not hasattr(self, 'recent_rewards'):
+                self.recent_rewards = deque(maxlen=10)
+                self.recent_deceptions = deque(maxlen=10)
+                self.recent_attack_success = deque(maxlen=10)
+        
             if training:
                 # High exploration phase
                 if self.steps < self.exploration_phase:
                     exploration_prob = 0.8
                 else:
                     exploration_prob = self.epsilon
-                    
+                
                 if np.random.rand() <= exploration_prob:
-                    # Enhanced exploration strategy
-                    if np.random.rand() < self.random_action_prob:
-                        # Completely random action from discrete values
-                        deception_amount = np.random.choice(possible_deceptions)
-                        sensor_selection = np.random.randint(2, size=self.numOfZ)
-                    else:
-                        # Strategic exploration
-                        if np.random.rand() < 0.2:  # 20% chance of extreme values
-                            deception_amount = np.random.choice([20,50,80])  # Choose from low, mid, high
-                        else:
-                            # Random value from possible deceptions
-                            deception_amount = np.random.choice(possible_deceptions)
+                    # Adaptive exploration based on recent performance
+                    if len(self.recent_rewards) > 0:
+                        avg_reward = np.mean(self.recent_rewards)
+                        avg_attack_success = np.mean(self.recent_attack_success)
+                        last_deception = self.recent_deceptions[-1] if self.recent_deceptions else 50
                         
-                        # More diverse sensor selection
-                        base_selection = np.random.randint(2, size=self.numOfZ)
-                        noise = np.random.normal(0, self.exploration_noise, size=self.numOfZ)
-                        sensor_selection = (base_selection + noise > 0.5).astype(int)
+                        # Adjust deception amount based on performance
+                        if avg_reward < 0:  # Poor performance
+                            if avg_attack_success > 0.5:  # High attack success rate
+                                # Increase deception to counter attacks
+                                deception_candidates = possible_deceptions[possible_deceptions > last_deception]
+                                if len(deception_candidates) > 0:
+                                    deception_amount = np.min(deception_candidates)
+                                else:
+                                    deception_amount = last_deception
+                            else:
+                                # Decrease deception to reduce cost
+                                deception_candidates = possible_deceptions[possible_deceptions < last_deception]
+                                if len(deception_candidates) > 0:
+                                    deception_amount = np.max(deception_candidates)
+                                else:
+                                    deception_amount = last_deception
+                        else:  # Good performance
+                            # Stay close to current deception amount
+                            closest_idx = np.abs(possible_deceptions - last_deception).argmin()
+                            deception_amount = possible_deceptions[closest_idx]
+                            
+                        # Add small random adjustment
+                        step_size = 5
+                        deception_amount += np.random.choice([-step_size, 0, step_size])
+                        deception_amount = np.clip(deception_amount, 20, 80)
+                    else:
+                        # Initial exploration
+                        deception_amount = np.random.choice(possible_deceptions)
+                    
+                    # More strategic sensor selection
+                    if hasattr(self, 'last_successful_selection'):
+                        # Keep previously successful selections with high probability
+                        sensor_selection = self.last_successful_selection.copy()
+                        # Randomly modify some sensors
+                        modify_mask = np.random.random(self.numOfZ) < 0.2
+                        sensor_selection[modify_mask] = np.random.randint(2, size=np.sum(modify_mask))
+                    else:
+                        sensor_selection = np.random.randint(2, size=self.numOfZ)
                 else:
                     # Exploitation with discrete values
                     q_values = self.model.predict(state, verbose=0)[0]
@@ -2070,25 +2103,25 @@ class DQNAgent:
                         np.abs(possible_deceptions - raw_deception).argmin()
                     ]
                     
-                    sensor_probs = self.sigmoid(q_values[1:self.numOfZ+1] + np.random.normal(0, 0.1, self.numOfZ))
+                    sensor_probs = self.sigmoid(q_values[1:self.numOfZ+1])
                     sensor_selection = (sensor_probs > 0.5).astype(int)
             else:
                 # Pure exploitation for evaluation
                 q_values = self.model.predict(state, verbose=0)[0]
-                
-                # Convert continuous Q-value to discrete deception amount
                 raw_deception = q_values[0] * 80
-                # Find closest discrete value
                 deception_amount = possible_deceptions[
                     np.abs(possible_deceptions - raw_deception).argmin()
                 ]
-                
                 sensor_selection = (q_values[1:self.numOfZ+1] > 0.5).astype(int)
-                
-            return {
+            
+            # Store the action for future reference
+            self.last_action = {
                 'deception_amount': np.array([deception_amount]),
                 'sensor_selection': sensor_selection
             }
+            
+            return self.last_action
+            
         except Exception as e:
             print(f"Error in act: {e}")
             return self.get_default_action()
@@ -2098,63 +2131,58 @@ class DQNAgent:
 
 
     def replay(self):
+        """Train the model using experience replay"""
         if len(self.memory) < self.batch_size:
             return
         
         try:
+            # Sample batch from memory
             minibatch = random.sample(self.memory, self.batch_size)
-            states, actions, rewards, next_states, dones = [], [], [], [], []
             
-            for state, action, reward, next_state, done in minibatch:
-                states.append(state)
-                # Clip action values to be within valid range
-                clipped_action = np.clip(action, 0, self.action_dim)  # Add this line
-                actions.append(clipped_action.astype(np.int32))
-                rewards.append(reward)
-                next_states.append(next_state)
-                dones.append(done)
-                
-            # Convert to numpy arrays with proper types
-            states = np.array(states, dtype=np.float32)
-            actions = np.array(actions, dtype=np.int32)
-            rewards = np.array(rewards, dtype=np.float32)
-            next_states = np.array(next_states, dtype=np.float32)
-            dones = np.array(dones, dtype=np.float32)
+            # Separate batch into components
+            states = np.array([x[0] for x in minibatch])
+            actions = np.array([x[1] for x in minibatch])
+            rewards = np.array([x[2] for x in minibatch])
+            next_states = np.array([x[3] for x in minibatch])
+            dones = np.array([x[4] for x in minibatch])
+
+            # Get current Q values
+            current_q = self.model.predict(states, verbose=0)
             
-            with tf.GradientTape() as tape:
-                current_q = self.model(states)
-                next_q = self.target_model(next_states)
-                
-                # Ensure actions are within valid range
-                next_actions = tf.clip_by_value(
-                    tf.argmax(self.model(next_states), axis=1),
-                    0,
-                    self.action_dim - 1
-                )
-                next_q_values = tf.gather(next_q, next_actions, batch_dims=1)
-                
-                targets = rewards + (1 - dones) * self.gamma * next_q_values
-                
-                # Ensure actions are within valid range for gathering
-                actions_for_gather = tf.clip_by_value(
-                    tf.cast(actions, tf.int32),
-                    0,
-                    self.action_dim - 1
-                )
-                predicted_q_values = tf.gather(current_q, actions_for_gather, batch_dims=1)
-                loss = tf.reduce_mean(tf.square(targets - predicted_q_values))
-                
-            grads = tape.gradient(loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            # Get next Q values from target model
+            next_q = self.target_model.predict(next_states, verbose=0)
             
-            return float(loss.numpy())
+            # Calculate target Q values
+            max_next_q = np.max(next_q, axis=1)
+            target_q = rewards + (1 - dones) * self.gamma * max_next_q
             
+            # Update Q values for taken actions
+            for i in range(self.batch_size):
+                action_idx = np.argmax(actions[i])  # Get index of taken action
+                current_q[i, action_idx] = target_q[i]
+            
+            # Train the model
+            self.model.fit(states, current_q, batch_size=self.batch_size, epochs=1, verbose=0)
+            
+            # Decay epsilon
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+                
         except Exception as e:
             print(f"Error in replay: {str(e)}")
-            print(f"Action shape: {actions.shape if 'actions' in locals() else 'N/A'}")
-            print(f"Action values: {actions if 'actions' in locals() else 'N/A'}")
-            print(f"Current Q shape: {current_q.shape if 'current_q' in locals() else 'N/A'}")
-            return None
+            print(f"Action shape: {actions.shape}")
+            print(f"Action values: {actions}")
+            print(f"Current Q shape: {current_q.shape}")
+            return
+        
+    def update_performance_memory(self, reward, attack_success_rate):
+        """Update memory of recent performance"""
+        self.recent_rewards.append(reward)
+        self.recent_attack_success.append(attack_success_rate)
+        if hasattr(self, 'last_action'):
+            self.recent_deceptions.append(self.last_action['deception_amount'][0])
+            if reward > 0:  # If action was successful
+                self.last_successful_selection = self.last_action['sensor_selection']
 
     def update_target_model(self):
             """Update target network"""
@@ -2227,12 +2255,12 @@ class MetricsManager:
             
             # Plot all metrics
             plots = [
-                (episode_rewards, 'Episode Rewards', 'Total Reward', 250),
-                (average_detection_rates, 'Attack Detection Rates', 'Detection Rate', 250),
+                (episode_rewards, 'Episode Rewards', 'Total Reward', 100),
+                (average_detection_rates, 'Attack Detection Rates(%)', 'Detection Rate', 100),
                 (average_successful_attacks, 'Successful Attack Counts', 'Number of Successful Attacks', 20),
-                (average_state_deviations, 'Average State Deviations', 'Average Deviation', 250),
-                (average_success_count, 'Average Success Count', 'Success Count', 100),
-                (average_deception_amount, 'Average Deception Amount', 'Deception Amount', 100)
+                (average_state_deviations, 'Average State Deviations(%)', 'Average Deviation', 100),
+                (average_success_count, 'Average Detection (%)', 'Success Count', 100),
+                (average_deception_amount, 'Average Deception Amount(%)', 'Deception Amount', 100)
             ]
             
             for idx, (data, title, ylabel, ylim) in enumerate(plots, 1):
@@ -2478,6 +2506,8 @@ class IEEE14BusPowerSystemEnv(gym.Env):
             
             next_state = self._convert_state_to_array({'sensor_readings': self.AttackReturn.get('StatesRec', np.zeros((10, 13), dtype=np.float32))})
             done = bool(self.current_step >= self.max_steps)
+
+
             
             info = {
                 'state_deviation': self.Deviation,
@@ -2491,7 +2521,8 @@ class IEEE14BusPowerSystemEnv(gym.Env):
             }
             
             self.state = next_state
-            return next_state, total_reward, done, info
+            total_rewards = total_reward/self.current_step
+            return next_state, total_rewards, done, info
                 
         except Exception as e:
             print(f"Error in step function: {str(e)}")
@@ -2514,7 +2545,7 @@ class IEEE14BusPowerSystemEnv(gym.Env):
         reward = 0
         
         # Penalize high state deviation
-        reward -= state_deviation * 0.1
+        reward -= state_deviation * 10
         
         # Penalize successful attacks
         if successful_attack:
@@ -2525,11 +2556,11 @@ class IEEE14BusPowerSystemEnv(gym.Env):
             reward += 40*successful_detection_count
         
         # Penalize excessive deception
-        reward -= (deception_amount) *0.5
+        reward -= (deception_amount) *10
         
         # Reward successful defense
         if successful_detection_count > 0:
-            reward += 20
+            reward += 10
         
         return reward
 
@@ -2605,7 +2636,7 @@ def main():
         episode_wise_deception_amount = []
 
         # Training loop
-        episodes = 30
+        episodes = 60
         completed_episodes = 0
         for episode in range(episodes):
             print(f"\nStarting Episode {episode}")
@@ -2631,6 +2662,10 @@ def main():
                 print(f"deception_amount: {info['deception_amount']}")
                 print(f"Current step: {step_count}/{env.max_steps}")
                 print(f"Episode ending: {done}")
+
+                attack_success_rate = info['successful_attack'] / (info['successful_attack'] + info['successful_detection'] + 1e-10)  # Added small constant to avoid division by zero
+                agent.update_performance_memory(reward, attack_success_rate)
+                
 
                 episode_metrics.append({
                     'state_deviation': info['state_deviation'],

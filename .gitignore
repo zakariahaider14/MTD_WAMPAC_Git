@@ -8,3 +8,9 @@
 /Plot/*
 /training_logs/*
 *.ipynb
+*.csv
+*.pdf
+*.png
+*.jpg
+*.eps
+*.svg
